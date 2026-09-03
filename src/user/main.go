@@ -3,19 +3,19 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang NetworkMonitor ../kernel/network_monitor.bpf.c -- -I../kernel -Wno-missing-declarations -O2 -g
 
 import (
-	"bytes"
-	"encoding/binary"
-	"errors"
-	"log"
-	"net"
-	"os"
-	"os/signal"
-	"syscall"
+    "bytes"
+    "encoding/binary"
+    "errors"
+    "log"
+    "net"
+    "os"
+    "os/signal"
+    "syscall"
 
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/ringbuf"
-	"github.com/cilium/ebpf/rlimit"
+    "github.com/cilium/ebpf"
+    "github.com/cilium/ebpf/link"
+    "github.com/cilium/ebpf/ringbuf"
+    "github.com/cilium/ebpf/rlimit"
 )
 
 // ThreatEvent represents a detected threat event
@@ -35,69 +35,86 @@ func intToIP(ip uint32) string {
 }
 
 func main() {
-	// Remove resource limits for eBPF map allocation
-	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatalf("Failed to remove memlock: %v", err)
-	}
+    // Remove resource limits for eBPF map allocation
+    if err := rlimit.RemoveMemlock(); err != nil {
+        log.Fatalf("Failed to remove memlock: %v", err)
+    }
 
-	// Load compiled eBPF objects into the kernel
-	var objs NetworkMonitorObjects
-	if err := LoadNetworkMonitorObjects(&objs, nil); err != nil {
-		log.Fatalf("Failed to load objects: %v", err)
-	}
-	defer objs.Close()
+    // Load compiled eBPF objects into the kernel
+    var objs NetworkMonitorObjects
+    if err := LoadNetworkMonitorObjects(&objs, nil); err != nil {
+        log.Fatalf("Failed to load objects: %v", err)
+    }
+    defer objs.Close()
 
-	// Attach to the loopback interface for safe testing
-	ifaceName := "lo"
-	iface, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		log.Fatalf("Failed to find interface %s: %v", ifaceName, err)
-	}
+    // Attach to the loopback interface for safe testing
+    ifaceName := "lo"
+    iface, err := net.InterfaceByName(ifaceName)
+    if err != nil {
+        log.Fatalf("Failed to find interface %s: %v", ifaceName, err)
+    }
 
-	// 1. Attach XDP Hook (Ingress)
-	xdpLink, err := link.AttachXDP(link.XDPOptions{
-		Program:   objs.XdpIngress,
-		Interface: iface.Index,
-	})
-	if err != nil {
-		log.Fatalf("Failed to attach XDP: %v", err)
-	}
-	defer xdpLink.Close()
-	log.Printf("XDP attached to %s (Ingress)", ifaceName)
+    // 1. Attach XDP Hook (Ingress)
+    xdpLink, err := link.AttachXDP(link.XDPOptions{
+        Program:   objs.XdpIngress,
+        Interface: iface.Index,
+    })
+    if err != nil {
+        log.Fatalf("Failed to attach XDP: %v", err)
+    }
+    defer xdpLink.Close()
+    log.Printf("XDP attached to %s (Ingress)", ifaceName)
 
-	// 2. Attach TCX Hook (Egress)
-	tcxLink, err := link.AttachTCX(link.TCXOptions{
-		Program:   objs.TcxEgress,
-		Interface: iface.Index,
-		Attach:    ebpf.AttachTCXEgress,
-	})
-	if err != nil {
-		log.Fatalf("Failed to attach TCX: %v (Ensure you are on Linux 6.6+)", err)
-	}
-	defer tcxLink.Close()
-	log.Printf("TCX attached to %s (Egress)", ifaceName)
+    // 2. Attach TCX Hook (Egress)
+    tcxLink, err := link.AttachTCX(link.TCXOptions{
+        Program:   objs.TcxEgress,
+        Interface: iface.Index,
+        Attach:    ebpf.AttachTCXEgress,
+    })
+    if err != nil {
+        log.Fatalf("Failed to attach TCX: %v (Ensure you are on Linux 6.6+)", err)
+    }
+    defer tcxLink.Close()
+    log.Printf("TCX attached to %s (Egress)", ifaceName)
 
-	// Open Ring Buffer Reader
+    // ----------------------------------------------------
+    // NEW: SEED ARP SPOOFING TRUSTED MAC MAP
+    // ----------------------------------------------------
+    // Let's pretend our Gateway IP is 192.168.1.1
+    gatewayIP := binary.LittleEndian.Uint32(net.ParseIP("192.168.1.1").To4())
+    
+    // Let's pretend our Gateway's real, trusted MAC is aa:bb:cc:dd:ee:ff
+    realMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+    var macBytes [6]byte
+    copy(macBytes[:], realMAC)
+
+    // Push the trusted pair into the eBPF map
+    err = objs.TrustedMacs.Update(&gatewayIP, &macBytes, ebpf.UpdateAny)
+    if err != nil {
+        log.Fatalf("Failed to seed trusted MAC map: %v", err)
+    }
+    log.Println("Seeded ARP protection for gateway 192.168.1.1")
+
+    // Open Ring Buffer Reader
     rd, err := ringbuf.NewReader(objs.Alerts)
     if err != nil {
         log.Fatalf("Opening ringbuf reader: %s", err)
     }
     defer rd.Close()
 
-	// Graceful shutdown
-	stopper := make(chan os.Signal, 1)
-	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+    // Graceful shutdown
+    stopper := make(chan os.Signal, 1)
+    signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
-	go func() {
+    go func() {
         <-stopper
         log.Println("Detaching hooks and closing ring buffer...")
         rd.Close()
     }()
 
+    log.Println("Listening for threat events via Ring Buffer... Press Ctrl+C to exit.")
 
-	log.Println("Listening for threat events via Ring Buffer... Press Ctrl+C to exit.")
-
-	for {
+    for {
         record, err := rd.Read()
         if err != nil {
             if errors.Is(err, ringbuf.ErrClosed) {
@@ -121,6 +138,10 @@ func main() {
             threatType = "DATA_EXFILTRATION"
         case 3:
             threatType = "DNS_TUNNELING"
+        case 4:
+            threatType = "ARP_SPOOFING"
+        default:
+            threatType = "UNKNOWN"
         }
 
         log.Printf("[ALERT] Type: %s | Src: %s | Dst: %s | Action: DROP", 
