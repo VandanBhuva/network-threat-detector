@@ -1,14 +1,28 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 
+// --------------------------------------------------------
+// CONSTANTS & MACROS
+// --------------------------------------------------------
 #define ETH_P_IP 0x0800
 #define IPPROTO_TCP 6
-#define THRESHOLD 1000 // SYN packets per window
-#define TIME_WINDOW_NS 1000000000ULL // 1 second
+#define IPPROTO_UDP 17
+#define DNS_PORT 53
+
+#define THRESHOLD 1000                  // Max SYN packets per window
+#define TIME_WINDOW_NS 1000000000ULL    // 1 second windoe
+#define EXFIL_THRESHOLD 104857600       // 100 MB outbound data limit per IP
+#define DNS_TUNNEL_SIZE 256             // Max normal DNS query size in bytes
 
 // Helper for byte-swapping (endianness)
 #define bpf_htons(x) __builtin_bswap16(x)
 
+// --------------------------------------------------------
+// MAP DEFINITIONS
+// --------------------------------------------------------
+
+// Ingress SYN Tracker
+// Rate limit structure to track SYN packet counts
 struct rate_limit {
     __u64 last_update;
     __u32 count;
@@ -22,7 +36,22 @@ struct {
     __uint(max_entries, 65536);
 } syn_tracker SEC(".maps");
 
-// Shared map to hold packet counts. 
+// Egress Connection Tracker
+// Tracks outbound connection state
+struct egress_state {
+    __u64 byte_count;
+    __u64 last_packet_time;
+};
+
+// Tracks outbound byte volume per destination IP
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u32); // Destination IPv4 Address
+    __type(value, struct egress_state);
+    __uint(max_entries, 65536);
+} egress_tracker SEC(".maps");
+
+// Generic packet counter for testing
 // Key 0 = Ingress (XDP), Key 1 = Egress (TCX)
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -31,7 +60,7 @@ struct {
     __uint(max_entries, 2);
 } pkt_count SEC(".maps");
 
-// The Ingress Hook (Fast Path)
+// Ingress Hook (SYN Flood Shield)
 SEC("xdp")
 int xdp_ingress(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
@@ -92,15 +121,82 @@ int xdp_ingress(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
-// The Egress Hook (Socket-aware)
+// Egress Hook (Exfiltration & DNS tunneling detect)
 SEC("tcx/egress")
 int tcx_egress(struct __sk_buff *skb) {
+    // In TCX, we can access the packet data directly via the skb pointers
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    // 1. Parse Ethernet Header
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return TCX_PASS;
+
+    // Only inspect IPv4 traffic
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return TCX_PASS;
+
+    // 2. Parse IPv4 Header
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return TCX_PASS;
+
+    __u32 dst_ip = ip->daddr;
+    __u32 pkt_len = skb->len; // Total packet length from the sk_buff metadata
+    __u64 now = bpf_ktime_get_ns();
+
+    // ----------------------------------------------------
+    // BEHAVIOR A: DATA EXFILTRATION DETECTION
+    // ----------------------------------------------------
+    // We track the total outbound bytes sent to a specific external IP.
+    struct egress_state *state = bpf_map_lookup_elem(&egress_tracker, &dst_ip);
+    if (state) {
+        // Atomic add because multiple CPU cores might process egress traffic
+        __sync_fetch_and_add(&state->byte_count, pkt_len);
+        state->last_packet_time = now;
+        
+        // If a background process sends over 100MB to a single IP, drop it.
+        if (state->byte_count > EXFIL_THRESHOLD) {
+            return TCX_DROP; 
+        }
+    } else {
+        // First time connecting to this IP: Initialize the state
+        struct egress_state new_state = { .byte_count = pkt_len, .last_packet_time = now };
+        bpf_map_update_elem(&egress_tracker, &dst_ip, &new_state, BPF_ANY);
+    }
+
+    // ----------------------------------------------------
+    // BEHAVIOR B: DNS TUNNELING DETECTION
+    // ----------------------------------------------------
+    if (ip->protocol == IPPROTO_UDP) {
+        // Calculate where the UDP header starts based on variable IP header length
+        struct udphdr *udp = (void *)ip + (ip->ihl * 4);
+        
+        // Parse UDP Header
+        if ((void *)(udp + 1) <= data_end) {
+            
+            // Check if outbound traffic is destined for port 53 (DNS)
+            if (udp->dest == bpf_htons(DNS_PORT)) {
+                
+                // Anomalous payload heuristic:
+                // Normal DNS queries are small. DNS Tunneling malware stuffs 
+                // massive encrypted payloads into the query domains or TXT records.
+                // If the UDP payload exceeds our baseline threshold, drop it.
+                if (bpf_htons(udp->len) > DNS_TUNNEL_SIZE) {
+                    return TCX_DROP;
+                }
+            }
+        }
+    }
+
+    // Increment the generic test counter for visibility
     __u32 key = 1;
     __u64 *value = bpf_map_lookup_elem(&pkt_count, &key);
     if (value) {
         __sync_fetch_and_add(value, 1);
     }
-    // TCX_PASS is essentially 0 (same as TC_ACT_OK)
+
     return TCX_PASS; 
 }
 
