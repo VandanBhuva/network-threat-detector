@@ -1,5 +1,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
+#include "event.h"
+
 
 // --------------------------------------------------------
 // CONSTANTS & MACROS
@@ -9,7 +11,7 @@
 #define IPPROTO_UDP 17
 #define DNS_PORT 53
 
-#define THRESHOLD 1000                  // Max SYN packets per window
+#define SYN_THRESHOLD 1000                  // Max SYN packets per window
 #define TIME_WINDOW_NS 1000000000ULL    // 1 second windoe
 #define EXFIL_THRESHOLD 104857600       // 100 MB outbound data limit per IP
 #define DNS_TUNNEL_SIZE 256             // Max normal DNS query size in bytes
@@ -20,6 +22,12 @@
 // --------------------------------------------------------
 // MAP DEFINITIONS
 // --------------------------------------------------------
+
+// The Ring Buffer map
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024); // 256 KB buffer size
+} alerts SEC(".maps");
 
 // Ingress SYN Tracker
 // Rate limit structure to track SYN packet counts
@@ -100,7 +108,18 @@ int xdp_ingress(struct xdp_md *ctx) {
                 rl->last_update = now;
             } else {
                 rl->count++;
-                if (rl->count > THRESHOLD) {
+                if (rl->count > SYN_THRESHOLD) {
+                    // Emit Threat Event
+                    struct threat_event *e = bpf_ringbuf_reserve(&alerts, sizeof(*e), 0);
+                    if (e) {
+                        e->timestamp = now;
+                        e->src_ip = src_ip;
+                        e->dst_ip = ip->daddr;
+                        e->event_type = EVENT_TYPE_SYN_FLOOD;
+                        e->action_taken = ACTION_DROP;
+                        bpf_ringbuf_submit(e, 0);
+                    }
+
                     // Drop the malicious packet at line rate
                     return XDP_DROP;
                 }
@@ -158,6 +177,15 @@ int tcx_egress(struct __sk_buff *skb) {
         
         // If a background process sends over 100MB to a single IP, drop it.
         if (state->byte_count > EXFIL_THRESHOLD) {
+            struct threat_event *e = bpf_ringbuf_reserve(&alerts, sizeof(*e), 0);
+            if (e) {
+                e->timestamp = now;
+                e->src_ip = ip->saddr;
+                e->dst_ip = dst_ip;
+                e->event_type = EVENT_TYPE_EXFIL;
+                e->action_taken = ACTION_DROP;
+                bpf_ringbuf_submit(e, 0);
+            }
             return TCX_DROP; 
         }
     } else {
@@ -184,6 +212,15 @@ int tcx_egress(struct __sk_buff *skb) {
                 // massive encrypted payloads into the query domains or TXT records.
                 // If the UDP payload exceeds our baseline threshold, drop it.
                 if (bpf_htons(udp->len) > DNS_TUNNEL_SIZE) {
+                    struct threat_event *e = bpf_ringbuf_reserve(&alerts, sizeof(*e), 0);
+                    if (e) {
+                        e->timestamp = now;
+                        e->src_ip = ip->saddr;
+                        e->dst_ip = dst_ip;
+                        e->event_type = EVENT_TYPE_DNS_TUNNEL;
+                        e->action_taken = ACTION_DROP;
+                        bpf_ringbuf_submit(e, 0);
+                    }
                     return TCX_DROP;
                 }
             }

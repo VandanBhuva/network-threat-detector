@@ -3,17 +3,36 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang NetworkMonitor ../kernel/network_monitor.bpf.c -- -I../kernel -Wno-missing-declarations -O2 -g
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 )
+
+// ThreatEvent represents a detected threat event
+type ThreatEvent struct {
+    Timestamp   uint64
+    SrcIP       uint32
+    DstIP       uint32
+    EventType   uint32
+    ActionTaken uint32
+}
+
+// Helper to format IPs
+func intToIP(ip uint32) string {
+    result := make(net.IP, 4)
+    binary.LittleEndian.PutUint32(result, ip)
+    return result.String()
+}
 
 func main() {
 	// Remove resource limits for eBPF map allocation
@@ -58,29 +77,53 @@ func main() {
 	defer tcxLink.Close()
 	log.Printf("TCX attached to %s (Egress)", ifaceName)
 
+	// Open Ring Buffer Reader
+    rd, err := ringbuf.NewReader(objs.Alerts)
+    if err != nil {
+        log.Fatalf("Opening ringbuf reader: %s", err)
+    }
+    defer rd.Close()
+
 	// Graceful shutdown
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
-	// Polling loop
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	go func() {
+        <-stopper
+        log.Println("Detaching hooks and closing ring buffer...")
+        rd.Close()
+    }()
 
-	var ingressKey uint32 = 0
-	var egressKey uint32 = 1
-	var ingressCount, egressCount uint64
 
-	log.Println("Monitoring traffic... Press Ctrl+C to exit.")
+	log.Println("Listening for threat events via Ring Buffer... Press Ctrl+C to exit.")
 
 	for {
-		select {
-		case <-ticker.C:
-			objs.PktCount.Lookup(&ingressKey, &ingressCount)
-			objs.PktCount.Lookup(&egressKey, &egressCount)
-			log.Printf("Packets -> Ingress (XDP): %d | Egress (TCX): %d", ingressCount, egressCount)
-		case <-stopper:
-			log.Println("Detaching hooks and exiting...")
-			return
-		}
-	}
+        record, err := rd.Read()
+        if err != nil {
+            if errors.Is(err, ringbuf.ErrClosed) {
+                break
+            }
+            log.Printf("Error reading from ringbuf: %s", err)
+            continue
+        }
+
+        var event ThreatEvent
+        if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
+            log.Printf("Parsing ringbuf event: %s", err)
+            continue
+        }
+
+        var threatType string
+        switch event.EventType {
+        case 1:
+            threatType = "SYN_FLOOD"
+        case 2:
+            threatType = "DATA_EXFILTRATION"
+        case 3:
+            threatType = "DNS_TUNNELING"
+        }
+
+        log.Printf("[ALERT] Type: %s | Src: %s | Dst: %s | Action: DROP", 
+            threatType, intToIP(event.SrcIP), intToIP(event.DstIP))
+    }
 }
