@@ -16,6 +16,7 @@
 #define TIME_WINDOW_NS 1000000000ULL    // 1 second windoe
 #define EXFIL_THRESHOLD 104857600       // 100 MB outbound data limit per IP
 #define DNS_TUNNEL_SIZE 256             // Max normal DNS query size in bytes
+#define PORT_SCAN_THRESHOLD 10          // Max unique ports per window
 
 // Helper for byte-swapping (endianness)
 #define bpf_htons(x) __builtin_bswap16(x)
@@ -59,6 +60,22 @@ struct {
     __type(value, struct egress_state);
     __uint(max_entries, 65536);
 } egress_tracker SEC(".maps");
+
+// Port Scan Tracker State
+// Tracks unique destination ports targeted by a single source IP
+struct port_scan_state {
+    __u64 last_update;
+    __u16 unique_ports_count;
+    __u16 seen_ports[PORT_SCAN_THRESHOLD]; // Fixed array for verifier safety
+};
+
+// LRU Hash map for port scan tracking
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u32); // Source IPv4 Address
+    __type(value, struct port_scan_state);
+    __uint(max_entries, 65536);
+} port_scan_tracker SEC(".maps");
 
 // Generic packet counter for testing
 // Key 0 = Ingress (XDP), Key 1 = Egress (TCX)
@@ -163,11 +180,72 @@ int xdp_ingress(struct xdp_md *ctx) {
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
+    __u32 src_ip = ip->saddr;
+    __u64 now = bpf_ktime_get_ns();
+
+    // ----------------------------------------------------
+    // PORT SCAN DETECTOR (LAYER 4)
+    // ----------------------------------------------------
+    __u16 dst_port = tcp->dest;
+    struct port_scan_state *ps_state = bpf_map_lookup_elem(&port_scan_tracker, &src_ip);
+    
+    if (ps_state) {
+        if (now - ps_state->last_update > TIME_WINDOW_NS) {
+            // Time window expired, reset tracked ports
+            ps_state->unique_ports_count = 1;
+            ps_state->seen_ports[0] = dst_port;
+            ps_state->last_update = now;
+        } else {
+            // Check if this port is new to us within the time window
+            bool is_new_port = true;
+            
+            // #pragma unroll forces the compiler to flatten the loop, 
+            // keeping the strict eBPF verifier happy since it guarantees an exit.
+            #pragma unroll
+            for (int i = 0; i < PORT_SCAN_THRESHOLD; i++) {
+                if (i >= ps_state->unique_ports_count) {
+                    break;
+                }
+                if (ps_state->seen_ports[i] == dst_port) {
+                    is_new_port = false;
+                    break;
+                }
+            }
+
+            if (is_new_port) {
+                if (ps_state->unique_ports_count < PORT_SCAN_THRESHOLD) {
+                    ps_state->seen_ports[ps_state->unique_ports_count] = dst_port;
+                    ps_state->unique_ports_count++;
+                }
+                
+                // If they hit threshold amount of unique ports, drop them!
+                if (ps_state->unique_ports_count >= PORT_SCAN_THRESHOLD) {
+                    struct threat_event *e = bpf_ringbuf_reserve(&alerts, sizeof(*e), 0);
+                    if (e) {
+                        e->timestamp = now;
+                        e->src_ip = src_ip;
+                        e->dst_ip = ip->daddr;
+                        e->event_type = 5; // EVENT_TYPE_PORT_SCAN
+                        e->action_taken = ACTION_DROP;
+                        bpf_ringbuf_submit(e, 0);
+                    }
+                    return XDP_DROP;
+                }
+            }
+        }
+    } else {
+        // First time tracking this IP
+        struct port_scan_state new_ps = {
+            .last_update = now,
+            .unique_ports_count = 1,
+        };
+        new_ps.seen_ports[0] = dst_port;
+        bpf_map_update_elem(&port_scan_tracker, &src_ip, &new_ps, BPF_ANY);
+    }
+
+
     // 4. Detect SYN Packet (SYN set, ACK not set)
     if (tcp->syn && !tcp->ack) {
-        __u32 src_ip = ip->saddr;
-        __u64 now = bpf_ktime_get_ns();
-        
         struct rate_limit *rl = bpf_map_lookup_elem(&syn_tracker, &src_ip);
         if (rl) {
             if (now - rl->last_update > TIME_WINDOW_NS) {
@@ -250,7 +328,7 @@ int tcx_egress(struct __sk_buff *skb) {
                 e->timestamp = now;
                 e->src_ip = ip->saddr;
                 e->dst_ip = dst_ip;
-                e->event_type = EVENT_TYPE_EXFIL;
+                e->event_type = EVENT_TYPE_EXFIL; // Ensure this is mapped correctly to 2 in your event.h if you have it
                 e->action_taken = ACTION_DROP;
                 bpf_ringbuf_submit(e, 0);
             }
@@ -285,7 +363,7 @@ int tcx_egress(struct __sk_buff *skb) {
                         e->timestamp = now;
                         e->src_ip = ip->saddr;
                         e->dst_ip = dst_ip;
-                        e->event_type = EVENT_TYPE_DNS_TUNNEL;
+                        e->event_type = EVENT_TYPE_DNS_TUNNEL; // Maps to 3
                         e->action_taken = ACTION_DROP;
                         bpf_ringbuf_submit(e, 0);
                     }

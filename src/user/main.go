@@ -78,7 +78,7 @@ func main() {
     log.Printf("TCX attached to %s (Egress)", ifaceName)
 
     // ----------------------------------------------------
-    // NEW: SEED ARP SPOOFING TRUSTED MAC MAP
+    // SEED ARP SPOOFING TRUSTED MAC MAP
     // ----------------------------------------------------
     // Let's pretend our Gateway IP is 192.168.1.1
     gatewayIP := binary.LittleEndian.Uint32(net.ParseIP("192.168.1.1").To4())
@@ -140,6 +140,8 @@ func main() {
             threatType = "DNS_TUNNELING"
         case 4:
             threatType = "ARP_SPOOFING"
+        case 5:
+            threatType = "PORT_SCAN" 
         default:
             threatType = "UNKNOWN"
         }
