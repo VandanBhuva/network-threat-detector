@@ -1,0 +1,13 @@
+# Build artifacts
+src/user/agent
+src/kernel/vmlinux.h
+
+# eBPF Generated Go Bindings and Bytecode
+src/user/*_bpfeb.go
+src/user/*_bpfel.go
+src/user/*_bpfeb.o
+src/user/*_bpfel.o
+
+# IDEs
+.vscode/
+.idea/
