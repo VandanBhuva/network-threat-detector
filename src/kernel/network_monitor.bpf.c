@@ -18,6 +18,10 @@
 #define DNS_TUNNEL_SIZE 256             // Max normal DNS query size in bytes
 #define PORT_SCAN_THRESHOLD 10          // Max unique ports per window
 
+#define BEACON_STRIKE_THRESHOLD 5           // How many consistent intervals before we drop
+#define JITTER_TOLERANCE_NS 50000000ULL     // 50ms tolerance for timing variance
+#define MIN_BEACON_INTERVAL_NS 500000000ULL // 500ms minimum interval to ignore bursty data streams
+
 // Helper for byte-swapping (endianness)
 #define bpf_htons(x) __builtin_bswap16(x)
 
@@ -76,6 +80,22 @@ struct {
     __type(value, struct port_scan_state);
     __uint(max_entries, 65536);
 } port_scan_tracker SEC(".maps");
+
+// Beacon Tracker State
+// Tracks the timing intervals of outbound connections
+struct beacon_state {
+    __u64 last_packet_time;
+    __u64 expected_interval;
+    __u32 strike_count;
+};
+
+// LRU Hash map for beacon tracking
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u32); // Destination IPv4 Address
+    __type(value, struct beacon_state);
+    __uint(max_entries, 65536);
+} beacon_tracker SEC(".maps");
 
 // Generic packet counter for testing
 // Key 0 = Ingress (XDP), Key 1 = Egress (TCX)
@@ -310,6 +330,74 @@ int tcx_egress(struct __sk_buff *skb) {
     __u32 dst_ip = ip->daddr;
     __u32 pkt_len = skb->len; // Total packet length from the sk_buff metadata
     __u64 now = bpf_ktime_get_ns();
+
+    // ----------------------------------------------------
+    // C2 BEACONING DETECTION (JITTER ANALYSIS)
+    // ----------------------------------------------------
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+        
+        // Verifier bounds check for TCP header
+        if ((void *)(tcp + 1) <= data_end) {
+            
+            // Only track outbound SYN packets to web ports (HTTP/HTTPS)
+            // This prevents mid-stream ACKs from ruining our timing math!
+            if ((tcp->dest == bpf_htons(80) || tcp->dest == bpf_htons(443)) && tcp->syn && !tcp->ack) {
+                
+                struct beacon_state *b_state = bpf_map_lookup_elem(&beacon_tracker, &dst_ip);
+                if (b_state) {
+                    __u64 delta = now - b_state->last_packet_time;
+                    
+                    // Only track intervals larger than 500ms
+                    if (delta > MIN_BEACON_INTERVAL_NS) {
+                        if (b_state->expected_interval == 0) {
+                            b_state->expected_interval = delta;
+                        } else {
+                            // Calculate variance
+                            __u64 diff = (delta > b_state->expected_interval) ? 
+                                        (delta - b_state->expected_interval) : 
+                                        (b_state->expected_interval - delta);
+                            
+                            // If variance is within our 50ms tolerance, it's a strike
+                            if (diff < JITTER_TOLERANCE_NS) {
+                                b_state->strike_count++;
+                                
+                                if (b_state->strike_count >= BEACON_STRIKE_THRESHOLD) {
+                                    struct threat_event *e = bpf_ringbuf_reserve(&alerts, sizeof(*e), 0);
+                                    if (e) {
+                                        e->timestamp = now;
+                                        e->src_ip = ip->saddr;
+                                        e->dst_ip = dst_ip;
+                                        e->event_type = 6; // EVENT_TYPE_C2_BEACON
+                                        e->action_taken = ACTION_DROP;
+                                        bpf_ringbuf_submit(e, 0);
+                                    }
+                                    return TCX_DROP;
+                                }
+                            } else {
+                                // Jitter is organic, reset tracker
+                                b_state->strike_count = 0;
+                                b_state->expected_interval = delta;
+                            }
+                        }
+                    } else {
+                        // Burst of SYNs (e.g. fast reconnects), reset
+                        b_state->strike_count = 0;
+                        b_state->expected_interval = 0;
+                    }
+                    b_state->last_packet_time = now;
+                } else {
+                    // First connection attempt
+                    struct beacon_state new_b_state = {
+                        .last_packet_time = now,
+                        .expected_interval = 0,
+                        .strike_count = 0
+                    };
+                    bpf_map_update_elem(&beacon_tracker, &dst_ip, &new_b_state, BPF_ANY);
+                }
+            }
+        }
+    }
 
     // ----------------------------------------------------
     // DATA EXFILTRATION DETECTION

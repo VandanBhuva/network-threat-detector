@@ -142,6 +142,8 @@ func main() {
             threatType = "ARP_SPOOFING"
         case 5:
             threatType = "PORT_SCAN" 
+        case 6:
+            threatType = "C2_BEACONING"
         default:
             threatType = "UNKNOWN"
         }
