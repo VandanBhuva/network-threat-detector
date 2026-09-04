@@ -22,6 +22,11 @@
 #define JITTER_TOLERANCE_NS 50000000ULL     // 50ms tolerance for timing variance
 #define MIN_BEACON_INTERVAL_NS 500000000ULL // 500ms minimum interval to ignore bursty data streams
 
+// UDP Amplification Thresholds
+#define UDP_AMP_THRESHOLD 512               // Drop inbound UDP payloads > 512 bytes from reflection ports
+#define NTP_PORT 123                        // Commonly abused amplification port
+#define MEMCACHED_PORT 11211                // Commonly abused amplification port
+
 // Helper for byte-swapping (endianness)
 #define bpf_htons(x) __builtin_bswap16(x)
 
@@ -191,6 +196,39 @@ int xdp_ingress(struct xdp_md *ctx) {
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
+
+    // ----------------------------------------------------
+    // UDP AMPLIFICATION DETECTOR (LAYER 4)
+    // ----------------------------------------------------
+    if (ip->protocol == IPPROTO_UDP) {
+        // Calculate where the UDP header starts based on variable IP header length
+        struct udphdr *udp = (void *)ip + (ip->ihl * 4);
+        
+        // Parse UDP Header
+        if ((void *)(udp + 1) <= data_end) {
+            
+            // Check if the source port is a known amplification vector (NTP or Memcached)
+            if (udp->source == bpf_htons(NTP_PORT) || udp->source == bpf_htons(MEMCACHED_PORT)) {
+                
+                // If the payload size is enormous, it's a reflection attack
+                if (bpf_htons(udp->len) > UDP_AMP_THRESHOLD) {
+                    struct threat_event *e = bpf_ringbuf_reserve(&alerts, sizeof(*e), 0);
+                    if (e) {
+                        e->timestamp = bpf_ktime_get_ns();
+                        e->src_ip = ip->saddr;
+                        e->dst_ip = ip->daddr;
+                        e->event_type = 7; // EVENT_TYPE_UDP_AMPLIFICATION
+                        e->action_taken = ACTION_DROP;
+                        bpf_ringbuf_submit(e, 0);
+                    }
+                    return XDP_DROP;
+                }
+            }
+        }
+        // Let all other non-malicious UDP traffic pass
+        return XDP_PASS;
+    }
+
 
     if (ip->protocol != IPPROTO_TCP)
         return XDP_PASS;

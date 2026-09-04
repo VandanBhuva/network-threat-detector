@@ -144,6 +144,8 @@ func main() {
             threatType = "PORT_SCAN" 
         case 6:
             threatType = "C2_BEACONING"
+        case 7:
+            threatType = "UDP_AMPLIFICATION" // NEW MAPPER
         default:
             threatType = "UNKNOWN"
         }
