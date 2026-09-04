@@ -153,7 +153,27 @@ func main() {
     go func() {
         <-stopper
         log.Println("Detaching hooks and closing ring buffer...")
+
+        // Read kernel metrics from the eBPF map
+        var udpDrops, synDrops, dataExfilDrops uint64
+        errUdp := objs.DropMetrics.Lookup(uint32(1), &udpDrops)
+        errSyn := objs.DropMetrics.Lookup(uint32(2), &synDrops)
+        errDataExfil := objs.DropMetrics.Lookup(uint32(3), &dataExfilDrops)
+        
+        if errUdp == nil && errSyn == nil && errDataExfil == nil {
+            log.Println("\n=================================================")
+            log.Println("  KERNEL ENFORCEMENT METRICS")
+            log.Println("=================================================")
+            log.Printf("[+] UDP Amplification Drops : %d", udpDrops)
+            log.Printf("[+] SYN Flood Drops         : %d", synDrops)
+            log.Printf("[+] Data Exfiltration Drops : %d", dataExfilDrops)
+            log.Println("=================================================")
+        } else {
+            log.Printf("Failed to read metrics map: %v %v", errUdp, errSyn)
+        }
+
         rd.Close()
+        os.Exit(0)
     }()
 
     log.Println("Listening for threat events... Emitting JSON to stdout.")

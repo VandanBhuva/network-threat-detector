@@ -111,6 +111,16 @@ struct {
     __uint(max_entries, 2);
 } pkt_count SEC(".maps");
 
+// Key 1 = UDP Amp Drops
+// Key 2 = SYN Flood Drops
+// Key 3 = Data Exfil Drops
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 10);
+} drop_metrics SEC(".maps");
+
 // eBPF doesn't have a standard nested ARP struct in vmlinux.h that includes 
 // the payload addresses, so we define the standard Ethernet/IPv4 ARP layout.
 struct arp_ipv4 {
@@ -134,7 +144,7 @@ struct {
 } trusted_macs SEC(".maps");
 
 
-// Ingress Hook (SYN Flood Shield)
+// Ingress Hook
 SEC("xdp")
 int xdp_ingress(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
@@ -221,6 +231,11 @@ int xdp_ingress(struct xdp_md *ctx) {
                         e->action_taken = ACTION_DROP;
                         bpf_ringbuf_submit(e, 0);
                     }
+                    // Increment kernel drop metric
+                    __u32 metric_key = 1;
+                    __u64 *metric_val = bpf_map_lookup_elem(&drop_metrics, &metric_key);
+                    if (metric_val) __sync_fetch_and_add(metric_val, 1);
+
                     return XDP_DROP;
                 }
             }
@@ -323,6 +338,10 @@ int xdp_ingress(struct xdp_md *ctx) {
                         e->action_taken = ACTION_DROP;
                         bpf_ringbuf_submit(e, 0);
                     }
+                    // Increment kernel drop metric
+                    __u32 metric_key = 2;
+                    __u64 *metric_val = bpf_map_lookup_elem(&drop_metrics, &metric_key);
+                    if (metric_val) __sync_fetch_and_add(metric_val, 1);
 
                     // Drop the malicious packet at line rate
                     return XDP_DROP;
@@ -458,6 +477,11 @@ int tcx_egress(struct __sk_buff *skb) {
                 e->action_taken = ACTION_DROP;
                 bpf_ringbuf_submit(e, 0);
             }
+            // Increment kernel drop metric
+            __u32 metric_key = 3;
+            __u64 *metric_val = bpf_map_lookup_elem(&drop_metrics, &metric_key);
+            if (metric_val) __sync_fetch_and_add(metric_val, 1);
+
             return TCX_DROP; 
         }
     } else {
