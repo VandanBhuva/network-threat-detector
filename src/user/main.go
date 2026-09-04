@@ -5,12 +5,14 @@ package main
 import (
     "bytes"
     "encoding/binary"
+    "encoding/json"
     "errors"
     "log"
     "net"
     "os"
     "os/signal"
     "syscall"
+    "time"
 
     "github.com/cilium/ebpf"
     "github.com/cilium/ebpf/link"
@@ -25,6 +27,34 @@ type ThreatEvent struct {
     DstIP       uint32
     EventType   uint32
     ActionTaken uint32
+}
+
+// Structured JSON payload for SIEM ingestion
+type AlertPayload struct {
+    Timestamp   string `json:"timestamp"`
+    ThreatType  string `json:"threat_type"`
+    SrcIP       string `json:"src_ip"`
+    DstIP       string `json:"dst_ip"`
+    Action      string `json:"action"`
+    MitreID     string `json:"mitre_attack_id"`
+    MitreName   string `json:"mitre_technique"`
+}
+
+// MitreLookup holds the ATT&CK framework context
+type MitreLookup struct {
+    Name string
+    ID   string
+}
+
+// Map our internal event IDs to MITRE ATT&CK techniques
+var MitreTable = map[uint32]MitreLookup{
+    1: {"Direct Network Flood", "T1498.001"},
+    2: {"Exfiltration Over Alternative Protocol", "T1048"},
+    3: {"Application Layer Protocol: DNS", "T1071.004"},
+    4: {"ARP Cache Poisoning", "T1557.002"},
+    5: {"Network Service Discovery", "T1046"},
+    6: {"Application Layer Protocol: Web Protocols", "T1071.001"},
+    7: {"Reflection Amplification", "T1498.002"},
 }
 
 // Helper to format IPs
@@ -112,7 +142,7 @@ func main() {
         rd.Close()
     }()
 
-    log.Println("Listening for threat events via Ring Buffer... Press Ctrl+C to exit.")
+    log.Println("Listening for threat events... Emitting JSON to stdout.")
 
     for {
         record, err := rd.Read()
@@ -145,12 +175,31 @@ func main() {
         case 6:
             threatType = "C2_BEACONING"
         case 7:
-            threatType = "UDP_AMPLIFICATION" // NEW MAPPER
+            threatType = "UDP_AMPLIFICATION" 
         default:
             threatType = "UNKNOWN"
         }
 
-        log.Printf("[ALERT] Type: %s | Src: %s | Dst: %s | Action: DROP", 
-            threatType, intToIP(event.SrcIP), intToIP(event.DstIP))
+        mitreContext := MitreTable[event.EventType]
+
+        // Construct the SIEM-ready JSON payload
+        alert := AlertPayload{
+            Timestamp:  time.Now().UTC().Format(time.RFC3339),
+            ThreatType: threatType,
+            SrcIP:      intToIP(event.SrcIP),
+            DstIP:      intToIP(event.DstIP),
+            Action:     "DROP", // All our current rules result in drops
+            MitreID:    mitreContext.ID,
+            MitreName:  mitreContext.Name,
+        }
+
+        jsonData, err := json.Marshal(alert)
+        if err != nil {
+            log.Printf("JSON marshaling failed: %v", err)
+            continue
+        }
+
+        // Print bare JSON so it can be easily piped into jq or a log shipper
+        os.Stdout.Write(append(jsonData, '\n'))
     }
 }
