@@ -7,6 +7,7 @@ import (
     "encoding/binary"
     "encoding/json"
     "errors"
+    "flag"
     "log"
     "net"
     "os"
@@ -65,6 +66,14 @@ func intToIP(ip uint32) string {
 }
 
 func main() {
+    // ----------------------------------------------------
+    // CLI FLAGS
+    // ----------------------------------------------------
+    ifaceFlag := flag.String("iface", "lo", "Network interface to attach the eBPF hooks to (e.g., lo, eth0, wlan0)")
+    gwIPFlag := flag.String("gateway-ip", "192.168.1.1", "IP address of the trusted gateway for ARP protection")
+    gwMACFlag := flag.String("gateway-mac", "aa:bb:cc:dd:ee:ff", "MAC address of the trusted gateway for ARP protection")
+    flag.Parse()
+
     // Remove resource limits for eBPF map allocation
     if err := rlimit.RemoveMemlock(); err != nil {
         log.Fatalf("Failed to remove memlock: %v", err)
@@ -78,7 +87,7 @@ func main() {
     defer objs.Close()
 
     // Attach to the loopback interface for safe testing
-    ifaceName := "lo"
+    ifaceName := *ifaceFlag
     iface, err := net.InterfaceByName(ifaceName)
     if err != nil {
         log.Fatalf("Failed to find interface %s: %v", ifaceName, err)
@@ -110,11 +119,16 @@ func main() {
     // ----------------------------------------------------
     // SEED ARP SPOOFING TRUSTED MAC MAP
     // ----------------------------------------------------
-    // Let's pretend our Gateway IP is 192.168.1.1
-    gatewayIP := binary.LittleEndian.Uint32(net.ParseIP("192.168.1.1").To4())
+    parsedIP := net.ParseIP(*gwIPFlag)
+    if parsedIP == nil {
+        log.Fatalf("Invalid gateway IP provided: %s", *gwIPFlag)
+    }
+    gatewayIP := binary.LittleEndian.Uint32(parsedIP.To4())
     
-    // Let's pretend our Gateway's real, trusted MAC is aa:bb:cc:dd:ee:ff
-    realMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+    realMAC, err := net.ParseMAC(*gwMACFlag)
+    if err != nil {
+        log.Fatalf("Invalid gateway MAC provided: %v", err)
+    }
     var macBytes [6]byte
     copy(macBytes[:], realMAC)
 
@@ -123,7 +137,7 @@ func main() {
     if err != nil {
         log.Fatalf("Failed to seed trusted MAC map: %v", err)
     }
-    log.Println("Seeded ARP protection for gateway 192.168.1.1")
+    log.Printf("Seeded ARP protection for gateway %s (%s)", *gwIPFlag, *gwMACFlag)
 
     // Open Ring Buffer Reader
     rd, err := ringbuf.NewReader(objs.Alerts)
